@@ -1,0 +1,6 @@
+{
+  "name": "Manajemen Sekolah — Proyek Kelas XI RPL/PPLG",
+  "description": "Aplikasi manajemen sekolah full-stack dengan autentikasi pengguna, sinkronisasi database lokal real-time, dasbor pemantauan aktivitas, ekspor PDF/Excel, mode gelap, dan asisten AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
