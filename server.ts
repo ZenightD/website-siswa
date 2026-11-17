@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
+import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 import {
   db,
@@ -1033,6 +1034,108 @@ app.delete('/api/mata-pelajaran/:id', requireAuth, (req: AuthedRequest, res: Res
   });
   emitActivityAndSync(log, 'mata_pelajaran');
   res.json({ ok: true });
+});
+
+// ================= GEMINI AI CHATBOX ENDPOINT =================
+
+app.post('/api/chat', optionalAuth, async (req: AuthedRequest, res: Response) => {
+  const started = Date.now();
+  const { message, history } = req.body as {
+    message?: string;
+    history?: Array<{ role: 'user' | 'assistant'; text: string }>;
+  };
+
+  if (!message || !message.trim()) {
+    res.status(400).json({ error: 'Pesan tidak boleh kosong.' });
+    return;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    res.status(503).json({
+      error: 'GEMINI_API_KEY belum dikonfigurasi di server. Silakan periksa panel Settings > Secrets.',
+    });
+    return;
+  }
+
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const analytics = getDashboardAnalytics();
+    const recentJurusan = listJurusan().map((j) => `${j.kode} (${j.nama})`).join(', ');
+    const recentKelas = listKelas().map((k) => k.nama).join(', ');
+
+    const systemInstruction = `Anda adalah Asisten Manajemen Sekolah yang responsif, ramah, dan terstruktur untuk aplikasi "Manajemen Sekolah — Proyek Kelas XI RPL/PPLG".
+Jawablah selalu dalam bahasa Indonesia yang jelas, ringkas, dan praktis.
+
+Konteks Data Real-Time Sekolah Saat Ini:
+- Jumlah Jurusan: ${analytics.counts.jurusan} (${recentJurusan})
+- Jumlah Kelas: ${analytics.counts.kelas} (${recentKelas})
+- Jumlah Siswa: ${analytics.counts.siswa}
+- Jumlah Guru: ${analytics.counts.guru}
+- Jumlah Mata Pelajaran: ${analytics.counts.mata_pelajaran}
+- Jumlah Pengguna Terdaftar: ${analytics.counts.users}
+- Total Log Aktivitas: ${analytics.counts.total_activities} (${analytics.counts.today_activities} aktivitas hari ini)
+- Pengguna aktif saat ini: ${req.authUser ? `${req.authUser.name} (${req.authUser.role})` : 'Pengunjung (belum login)'}
+
+Kemampuan Aplikasi yang dapat Anda bantu jelaskan:
+1. Sistem Login & Registrasi berbasis akun lokal dengan peran Admin, Guru, dan Siswa.
+2. Sinkronisasi database SQLite lokal secara real-time melalui WebSocket ke semua klien yang terhubung.
+3. Dasbor Interaktif untuk memantau aktivitas pengguna secara terperinci (grafik per jam/7 hari, kehadiran online, log detail).
+4. Modul CRUD Lengkap: Data Jurusan, Data Kelas, Data Siswa, Data Guru, dan Mata Pelajaran.
+5. Ekspor laporan ke format PDF dan Excel (.xlsx) dari Dasbor maupun tabel data akademik.
+6. Dukungan Mode Terang dan Mode Gelap.
+7. Konsep pembelajaran Laravel, Blade, relasi database MySQL/SQLite, dan CRUD untuk siswa XI RPL/PPLG.
+
+Berikan jawaban yang terfokus maksimal 3-5 paragraf pendek atau poin ringkas.`;
+
+    const recentTurns = Array.isArray(history) ? history.slice(-6) : [];
+    const promptWithContext = recentTurns.length > 0
+      ? `Riwayat percakapan singkat:\n${recentTurns
+          .map((t) => `${t.role === 'user' ? 'Pengguna' : 'Asisten'}: ${t.text}`)
+          .join('\n')}\n\nPertanyaan terbaru Pengguna: ${message.trim()}`
+      : message.trim();
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: promptWithContext,
+      config: {
+        systemInstruction,
+      },
+    });
+
+    const replyText = response.text?.trim();
+    if (!replyText) {
+      res.status(502).json({ error: 'Asisten AI tidak mengembalikan teks jawaban.' });
+      return;
+    }
+
+    const { ip, ua } = getClientMeta(req);
+    const log = recordActivity({
+      user: req.authUser ?? null,
+      action: 'AI_CHAT',
+      module: 'Asisten AI',
+      targetId: 'gemini-4-hydrogen',
+      description: `Mengajukan pertanyaan ke Asisten AI: "${message.trim().slice(0, 70)}${message.trim().length > 70 ? '...' : ''}"`,
+      metadata: { model: 'gemini-4-hydrogen', promptLength: message.trim().length },
+      ipAddress: ip,
+      userAgent: ua,
+      durationMs: Date.now() - started,
+    });
+    emitActivityAndSync(log);
+
+    res.json({ reply: replyText });
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : 'Gagal menghubungi layanan AI.';
+    res.status(500).json({ error: `Kesalahan layanan AI: ${errorMessage}` });
+  }
 });
 
 // ================= VITE / STATIC FRONTEND =================

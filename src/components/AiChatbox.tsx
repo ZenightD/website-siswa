@@ -6,10 +6,11 @@ interface ChatMessage {
   role: 'user' | 'assistant';
   text: string;
   timestamp: string;
+  isError?: boolean;
 }
 
 interface AiChatboxProps {
-  authToken?: string | null;
+  authToken: string | null;
 }
 
 const STARTER_PROMPTS = [
@@ -18,14 +19,15 @@ const STARTER_PROMPTS = [
   'Cara ekspor laporan PDF & Excel',
 ];
 
-export const AiChatbox: React.FC<AiChatboxProps> = () => {
+export const AiChatbox: React.FC<AiChatboxProps> = ({ authToken }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
       role: 'assistant',
-      text: 'Halo! Ini adalah antarmuka UI Asisten AI Manajemen Sekolah. Logika pemrosesan AI saat ini belum diaktifkan dan siap dihubungkan ke backend Laravel/AI di tahap berikutnya.',
+      text: 'Halo! Saya Asisten Manajemen Sekolah. Tanyakan apa saja mengenai data siswa, guru, kelas, penggunaan dasbor, ekspor laporan, atau materi Laravel XI RPL/PPLG.',
       timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
     },
   ]);
@@ -36,33 +38,78 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
     if (isOpen && listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight;
     }
-  }, [messages, isOpen]);
+  }, [messages, isOpen, loading]);
 
-  const sendMessage = (textToSend: string) => {
+  const sendMessage = async (textToSend: string) => {
     const trimmed = textToSend.trim();
-    if (!trimmed) return;
-
-    const nowTime = new Date().toLocaleTimeString('id-ID', {
-      hour: '2-digit',
-      minute: '2-digit',
-    });
+    if (!trimmed || loading) return;
 
     const userMsg: ChatMessage = {
       id: `u_${Date.now()}`,
       role: 'user',
       text: trimmed,
-      timestamp: nowTime,
+      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
     };
 
-    const noticeMsg: ChatMessage = {
-      id: `a_${Date.now() + 1}`,
-      role: 'assistant',
-      text: 'Pesan diterima pada antarmuka UI. Logika AI Asisten saat ini sedang dinonaktifkan sementara.',
-      timestamp: nowTime,
-    };
-
-    setMessages((prev) => [...prev, userMsg, noticeMsg]);
+    const nextMessages = [...messages, userMsg];
+    setMessages(nextMessages);
     setInput('');
+    setLoading(true);
+
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+
+      const historyPayload = nextMessages
+        .filter((m) => !m.isError && m.id !== 'welcome')
+        .slice(-6)
+        .map((m) => ({ role: m.role, text: m.text }));
+
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ message: trimmed, history: historyPayload }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `e_${Date.now()}`,
+            role: 'assistant',
+            text: data.error || 'Terjadi kesalahan saat memproses jawaban AI.',
+            timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+            isError: true,
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `a_${Date.now()}`,
+            role: 'assistant',
+            text: data.reply,
+            timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+          },
+        ]);
+      }
+    } catch {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `e_${Date.now()}`,
+          role: 'assistant',
+          text: 'Gagal terhubung ke server lokal untuk layanan Asisten AI.',
+          timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+          isError: true,
+        },
+      ]);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -75,7 +122,7 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
       {
         id: 'welcome',
         role: 'assistant',
-        text: 'Percakapan UI dibersihkan. Tombol dan tampilan Asisten AI tetap siap digunakan.',
+        text: 'Percakapan dibersihkan. Ada yang bisa saya bantu seputar Manajemen Sekolah?',
         timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
       },
     ]);
@@ -96,8 +143,8 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
                 <Bot className="h-4 w-4 text-white" />
               </div>
               <div>
-                <h3 className="text-sm font-bold leading-tight">Asisten AI</h3>
-                <p className="text-[11px] text-blue-100">UI Chatbox (Mode Siaga)</p>
+                <h3 className="text-sm font-bold leading-tight">Asisten Sekolah</h3>
+                <p className="text-[11px] text-blue-100">Bantuan responsif &amp; konteks data</p>
               </div>
             </div>
             <div className="flex items-center gap-1">
@@ -150,6 +197,8 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
                   className={`max-w-[78%] rounded-xl px-3.5 py-2.5 text-xs leading-relaxed ${
                     msg.role === 'user'
                       ? 'bg-[#1D5497] text-white dark:bg-blue-600'
+                      : msg.isError
+                      ? 'border border-red-200 bg-red-50 text-red-700 dark:border-red-900/60 dark:bg-red-950/50 dark:text-red-300'
                       : 'border border-slate-200 bg-white text-slate-800 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200'
                   }`}
                 >
@@ -166,9 +215,20 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
                 </div>
               </div>
             ))}
+
+            {loading && (
+              <div className="flex items-start gap-2.5">
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                  <Bot className="h-3.5 w-3.5" />
+                </div>
+                <div className="rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
+                  Sedang menyusun jawaban...
+                </div>
+              </div>
+            )}
           </div>
 
-          {/* Quick prompts UI */}
+          {/* Quick prompts */}
           {messages.length <= 2 && (
             <div className="flex flex-wrap gap-1.5 border-t border-slate-200 bg-white px-3 py-2 dark:border-slate-800 dark:bg-slate-900">
               {STARTER_PROMPTS.map((q) => (
@@ -193,12 +253,12 @@ export const AiChatbox: React.FC<AiChatboxProps> = () => {
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder="Tulis pesan pada UI chatbox..."
+              placeholder="Tulis pertanyaan Anda..."
               className="flex-1 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-blue-600 focus:bg-white focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100 dark:focus:bg-slate-800"
             />
             <button
               type="submit"
-              disabled={!input.trim()}
+              disabled={loading || !input.trim()}
               aria-label="Kirim pesan"
               className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#1D5497] text-white transition-colors hover:bg-[#17437A] disabled:opacity-50 dark:bg-blue-600 dark:hover:bg-blue-500"
             >
