@@ -12,11 +12,14 @@ import {
   Wifi,
   WifiOff,
   ChevronRight,
+  HardDrive,
+  Upload,
 } from 'lucide-react';
 import type {
   ActivityAction,
   ActivityLog,
   DashboardAnalytics,
+  DatabaseStatus,
   OnlineUser,
   User,
 } from '../types';
@@ -24,11 +27,13 @@ import { exportToExcel, exportToPdf } from '../utils/exportReport';
 
 interface DashboardViewProps {
   analytics: DashboardAnalytics | null;
+  databaseStatus: DatabaseStatus | null;
   activities: ActivityLog[];
   onlineUsers: OnlineUser[];
   wsConnected: boolean;
   currentUser: User;
   authToken: string;
+  onRefreshData: () => Promise<void>;
 }
 
 const ACTION_COLOR_MAP: Record<ActivityAction, string> = {
@@ -45,11 +50,13 @@ const ACTION_COLOR_MAP: Record<ActivityAction, string> = {
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   analytics,
+  databaseStatus,
   activities,
   onlineUsers,
   wsConnected,
   currentUser,
   authToken,
+  onRefreshData,
 }) => {
   const [chartRange, setChartRange] = useState<'hourly' | 'daily'>('hourly');
   const [hoveredIdx, setHoveredIdx] = useState<number | null>(null);
@@ -57,6 +64,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   const [moduleFilter, setModuleFilter] = useState<string>('ALL');
   const [actionFilter, setActionFilter] = useState<string>('ALL');
   const [selectedLog, setSelectedLog] = useState<ActivityLog | null>(null);
+  const [dbFeedback, setDbFeedback] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
 
   const uniqueModules = useMemo(() => {
     const set = new Set(activities.map((a) => a.module));
@@ -126,6 +135,84 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       });
     } catch {
       // Non-blocking audit log
+    }
+  };
+
+  const handleDownloadBackupJson = async () => {
+    setDbFeedback(null);
+    try {
+      const res = await fetch('/api/database/backup-json', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        setDbFeedback('Gagal mengunduh cadangan JSON.');
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `backup-manajemen-sekolah-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setDbFeedback('Cadangan JSON berhasil diunduh.');
+    } catch {
+      setDbFeedback('Tidak dapat terhubung ke server lokal.');
+    }
+  };
+
+  const handleDownloadSqlite = async () => {
+    setDbFeedback(null);
+    try {
+      const res = await fetch('/api/database/download-sqlite', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setDbFeedback(data.error || 'Gagal mengunduh file SQLite.');
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `manajemen_sekolah-${new Date().toISOString().slice(0, 10)}.db`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setDbFeedback('Berkas SQLite (.db) berhasil diunduh.');
+    } catch {
+      setDbFeedback('Tidak dapat terhubung ke server lokal.');
+    }
+  };
+
+  const handleRestoreJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setRestoring(true);
+    setDbFeedback(null);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const res = await fetch('/api/database/restore-json', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
+        body: JSON.stringify(parsed),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setDbFeedback(data.error || 'Gagal memulihkan file cadangan.');
+      } else {
+        await onRefreshData();
+        setDbFeedback(`Database dipulihkan (${data.restoredRows} baris tersimpan ke disk).`);
+      }
+    } catch {
+      setDbFeedback('Format file JSON tidak valid atau gagal dipulihkan.');
+    } finally {
+      setRestoring(false);
     }
   };
 
@@ -454,6 +541,79 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Local Database Durability & Backup Panel */}
+      <section className="rounded-xl border border-slate-200 bg-white p-5 dark:border-slate-800 dark:bg-slate-900">
+        <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-center">
+          <div className="flex items-start gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-blue-50 text-[#1D5497] dark:bg-blue-950/60 dark:text-blue-400">
+              <HardDrive className="h-5 w-5" />
+            </div>
+            <div>
+              <h2 className="font-display text-base font-bold text-slate-900 dark:text-slate-100">
+                Status Penyimpanan Database Lokal
+              </h2>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                <span className="font-mono">{databaseStatus?.fileName ?? 'data/manajemen_sekolah.db'}</span>
+                {' · '}
+                <span className="tabular-nums font-medium">
+                  {((databaseStatus?.fileSizeBytes ?? 0) / 1024).toFixed(1)} KB
+                </span>
+                {' · '}
+                <span>Mode {databaseStatus?.journalMode ?? 'DELETE'} (Sinkron {databaseStatus?.synchronousMode ?? 'FULL'})</span>
+                {' · '}
+                <span>
+                  Cadangan otomatis:{' '}
+                  {databaseStatus?.backupExists
+                    ? `${((databaseStatus.backupSizeBytes ?? 0) / 1024).toFixed(1)} KB`
+                    : 'Aktif'}
+                </span>
+              </p>
+              {dbFeedback && (
+                <p className="mt-1.5 text-xs font-medium text-[#1D5497] dark:text-blue-400">
+                  {dbFeedback}
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleDownloadBackupJson}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+            >
+              <Download className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400" />
+              Cadangan JSON
+            </button>
+
+            {currentUser.role === 'admin' && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleDownloadSqlite}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition-colors hover:bg-slate-50 whitespace-nowrap dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200 dark:hover:bg-slate-700"
+                >
+                  <Database className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                  Unduh File .db
+                </button>
+
+                <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg bg-[#1D5497] px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-[#17437A] whitespace-nowrap dark:bg-blue-600 dark:hover:bg-blue-500">
+                  <Upload className="h-3.5 w-3.5" />
+                  {restoring ? 'Memulihkan...' : 'Pulihkan JSON'}
+                  <input
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={handleRestoreJsonFile}
+                    disabled={restoring}
+                    className="sr-only"
+                  />
+                </label>
+              </>
+            )}
+          </div>
+        </div>
+      </section>
 
       {/* Detailed Activity Log Table */}
       <section className="rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">

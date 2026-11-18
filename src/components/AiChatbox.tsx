@@ -19,20 +19,57 @@ const STARTER_PROMPTS = [
   'Cara ekspor laporan PDF & Excel',
 ];
 
+const WELCOME_MSG: ChatMessage = {
+  id: 'welcome',
+  role: 'assistant',
+  text: 'Halo! Saya Asisten Manajemen Sekolah. Tanyakan apa saja mengenai data siswa, guru, kelas, penggunaan dasbor, ekspor laporan, atau materi Laravel XI RPL/PPLG.',
+  timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+};
+
 export const AiChatbox: React.FC<AiChatboxProps> = ({ authToken }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'welcome',
-      role: 'assistant',
-      text: 'Halo! Saya Asisten Manajemen Sekolah. Tanyakan apa saja mengenai data siswa, guru, kelas, penggunaan dasbor, ekspor laporan, atau materi Laravel XI RPL/PPLG.',
-      timestamp: new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
-    },
-  ]);
+  const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MSG]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const loadHistory = async () => {
+      try {
+        const headers: Record<string, string> = {};
+        if (authToken) headers.Authorization = `Bearer ${authToken}`;
+        const res = await fetch('/api/chat/history', { headers });
+        if (!res.ok) return;
+        const data = (await res.json()) as {
+          messages?: Array<{ id: string; role: 'user' | 'assistant'; text: string; created_at: string }>;
+        };
+        if (!active || !data.messages) return;
+        if (data.messages.length === 0) {
+          setMessages([WELCOME_MSG]);
+        } else {
+          setMessages(
+            data.messages.map((m) => ({
+              id: m.id,
+              role: m.role,
+              text: m.text,
+              timestamp: new Date(m.created_at).toLocaleTimeString('id-ID', {
+                hour: '2-digit',
+                minute: '2-digit',
+              }),
+            }))
+          );
+        }
+      } catch {
+        // Keep current messages if offline
+      }
+    };
+    loadHistory();
+    return () => {
+      active = false;
+    };
+  }, [authToken]);
 
   useEffect(() => {
     if (isOpen && listRef.current) {
@@ -117,7 +154,14 @@ export const AiChatbox: React.FC<AiChatboxProps> = ({ authToken }) => {
     sendMessage(input);
   };
 
-  const clearChat = () => {
+  const clearChat = async () => {
+    try {
+      const headers: Record<string, string> = {};
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
+      await fetch('/api/chat/history', { method: 'DELETE', headers });
+    } catch {
+      // Ignore network errors
+    }
     setMessages([
       {
         id: 'welcome',

@@ -7,25 +7,35 @@ import type {
   ActivityLog,
   ActivityModule,
   DashboardAnalytics,
+  DatabaseStatus,
   Guru,
   Jurusan,
   Kelas,
   MataPelajaran,
+  PersistedChatMessage,
   Siswa,
   User,
   UserRole,
-} from '../src/types.js';
+} from '../src/types.ts';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-const DB_PATH = path.join(DATA_DIR, 'manajemen_sekolah.db');
+export const DB_PATH = path.join(DATA_DIR, 'manajemen_sekolah.db');
+export const BACKUP_PATH = path.join(DATA_DIR, 'backup_snapshot.json');
 export const db = new DatabaseSync(DB_PATH);
 
-db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA busy_timeout = 5000;');
 db.exec('PRAGMA foreign_keys = ON;');
+db.exec('PRAGMA synchronous = FULL;');
+try {
+  db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+} catch {
+  // Ignore if not previously in WAL mode
+}
+db.exec('PRAGMA journal_mode = DELETE;');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
@@ -132,10 +142,20 @@ db.exec(`
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
   );
 
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id TEXT PRIMARY KEY,
+    user_id TEXT,
+    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
   CREATE INDEX IF NOT EXISTS idx_activity_created_at ON activity_logs(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_activity_module ON activity_logs(module);
   CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_logs(action);
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, created_at ASC);
 `);
 
 export function hashPassword(password: string): string {
@@ -564,7 +584,361 @@ function seedInitialData() {
   }
 }
 
-seedInitialData();
+export interface BackupSnapshot {
+  version: number;
+  exported_at: string;
+  data: {
+    users: Record<string, unknown>[];
+    jurusan: Record<string, unknown>[];
+    kelas: Record<string, unknown>[];
+    siswa: Record<string, unknown>[];
+    guru: Record<string, unknown>[];
+    mata_pelajaran: Record<string, unknown>[];
+    activity_logs: Record<string, unknown>[];
+    chat_messages: Record<string, unknown>[];
+  };
+}
+
+let lastSavedAt = new Date().toISOString();
+let backupTimer: NodeJS.Timeout | null = null;
+
+export function buildBackupSnapshot(includeSecrets = true): BackupSnapshot {
+  const userCols = includeSecrets
+    ? 'id, name, email, password_hash, role, avatar_color, status, last_login_at, created_at'
+    : 'id, name, email, role, avatar_color, status, last_login_at, created_at';
+  return {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    data: {
+      users: db.prepare(`SELECT ${userCols} FROM users`).all() as Record<string, unknown>[],
+      jurusan: db.prepare('SELECT * FROM jurusan').all() as Record<string, unknown>[],
+      kelas: db.prepare('SELECT * FROM kelas').all() as Record<string, unknown>[],
+      siswa: db.prepare('SELECT * FROM siswa').all() as Record<string, unknown>[],
+      guru: db.prepare('SELECT * FROM guru').all() as Record<string, unknown>[],
+      mata_pelajaran: db.prepare('SELECT * FROM mata_pelajaran').all() as Record<string, unknown>[],
+      activity_logs: db.prepare('SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 1000').all() as Record<string, unknown>[],
+      chat_messages: db.prepare('SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 500').all() as Record<string, unknown>[],
+    },
+  };
+}
+
+export function saveBackupSnapshot(): void {
+  try {
+    const snapshot = buildBackupSnapshot(true);
+    const tmpPath = `${BACKUP_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(snapshot, null, 2), 'utf8');
+    fs.renameSync(tmpPath, BACKUP_PATH);
+    lastSavedAt = snapshot.exported_at;
+  } catch {
+    // Non-fatal backup write failure
+  }
+}
+
+export function scheduleBackupSnapshot(): void {
+  lastSavedAt = new Date().toISOString();
+  if (backupTimer) clearTimeout(backupTimer);
+  backupTimer = setTimeout(() => {
+    saveBackupSnapshot();
+    backupTimer = null;
+  }, 400);
+}
+
+export function restoreFromSnapshot(snapshot: BackupSnapshot): { restoredRows: number } {
+  const d = snapshot?.data;
+  if (!d || !Array.isArray(d.users) || !Array.isArray(d.jurusan)) {
+    throw new Error('Format file cadangan JSON tidak valid.');
+  }
+
+  let restoredRows = 0;
+  db.exec('BEGIN TRANSACTION;');
+  try {
+    db.exec('PRAGMA foreign_keys = OFF;');
+    db.exec('DELETE FROM chat_messages;');
+    db.exec('DELETE FROM activity_logs;');
+    db.exec('DELETE FROM mata_pelajaran;');
+    db.exec('DELETE FROM siswa;');
+    db.exec('DELETE FROM guru;');
+    db.exec('DELETE FROM kelas;');
+    db.exec('DELETE FROM jurusan;');
+
+    const defaultPass = hashPassword('password123');
+    if (d.users.length > 0) {
+      db.exec('DELETE FROM users;');
+      const insU = db.prepare(`
+        INSERT INTO users (id, name, email, password_hash, role, avatar_color, status, last_login_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const u of d.users) {
+        insU.run(
+          String(u.id),
+          String(u.name),
+          String(u.email),
+          u.password_hash ? String(u.password_hash) : defaultPass,
+          String(u.role || 'siswa'),
+          String(u.avatar_color || '#1D5497'),
+          String(u.status || 'active'),
+          u.last_login_at ? String(u.last_login_at) : null,
+          String(u.created_at || new Date().toISOString())
+        );
+        restoredRows++;
+      }
+    }
+
+    const insJ = db.prepare(`
+      INSERT INTO jurusan (id, kode, nama, kaprodi, deskripsi, kuota, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const j of d.jurusan) {
+      insJ.run(
+        String(j.id),
+        String(j.kode),
+        String(j.nama),
+        String(j.kaprodi),
+        String(j.deskripsi ?? ''),
+        Number(j.kuota ?? 36),
+        String(j.created_at || new Date().toISOString()),
+        String(j.updated_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insK = db.prepare(`
+      INSERT INTO kelas (id, nama, tingkat, jurusan_id, wali_kelas, kapasitas, tahun_ajaran, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const k of d.kelas ?? []) {
+      insK.run(
+        String(k.id),
+        String(k.nama),
+        String(k.tingkat || 'XI'),
+        String(k.jurusan_id),
+        String(k.wali_kelas),
+        Number(k.kapasitas ?? 36),
+        String(k.tahun_ajaran || '2026/2027'),
+        String(k.created_at || new Date().toISOString()),
+        String(k.updated_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insG = db.prepare(`
+      INSERT INTO guru (id, nip, nama, bidang_studi, email, no_telp, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const g of d.guru ?? []) {
+      insG.run(
+        String(g.id),
+        String(g.nip),
+        String(g.nama),
+        String(g.bidang_studi),
+        String(g.email),
+        String(g.no_telp ?? '-'),
+        String(g.status || 'Aktif'),
+        String(g.created_at || new Date().toISOString()),
+        String(g.updated_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insS = db.prepare(`
+      INSERT INTO siswa (id, nis, nama, kelas_id, jenis_kelamin, email, status, nilai_rata, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const s of d.siswa ?? []) {
+      insS.run(
+        String(s.id),
+        String(s.nis),
+        String(s.nama),
+        String(s.kelas_id),
+        String(s.jenis_kelamin || 'L'),
+        String(s.email),
+        String(s.status || 'Aktif'),
+        Number(s.nilai_rata ?? 85),
+        String(s.created_at || new Date().toISOString()),
+        String(s.updated_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insM = db.prepare(`
+      INSERT INTO mata_pelajaran (id, kode, nama, jurusan_id, guru_id, jam_per_minggu, tingkat, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const m of d.mata_pelajaran ?? []) {
+      insM.run(
+        String(m.id),
+        String(m.kode),
+        String(m.nama),
+        m.jurusan_id ? String(m.jurusan_id) : null,
+        m.guru_id ? String(m.guru_id) : null,
+        Number(m.jam_per_minggu ?? 4),
+        String(m.tingkat || 'XI'),
+        String(m.created_at || new Date().toISOString()),
+        String(m.updated_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insA = db.prepare(`
+      INSERT INTO activity_logs (id, user_id, user_name, user_email, user_role, action, module, target_id, description, metadata_json, ip_address, user_agent, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const a of d.activity_logs ?? []) {
+      insA.run(
+        String(a.id),
+        a.user_id ? String(a.user_id) : null,
+        String(a.user_name),
+        String(a.user_email),
+        String(a.user_role),
+        String(a.action),
+        String(a.module),
+        a.target_id ? String(a.target_id) : null,
+        String(a.description),
+        a.metadata_json ? String(a.metadata_json) : null,
+        String(a.ip_address || '127.0.0.1'),
+        String(a.user_agent || 'Backup Restore'),
+        Number(a.duration_ms ?? 10),
+        String(a.created_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    const insC = db.prepare(`
+      INSERT INTO chat_messages (id, user_id, role, text, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const c of d.chat_messages ?? []) {
+      insC.run(
+        String(c.id),
+        c.user_id ? String(c.user_id) : null,
+        String(c.role),
+        String(c.text),
+        String(c.created_at || new Date().toISOString())
+      );
+      restoredRows++;
+    }
+
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec('COMMIT;');
+    saveBackupSnapshot();
+    return { restoredRows };
+  } catch (err) {
+    db.exec('ROLLBACK;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    throw err;
+  }
+}
+
+function initializeDatabase() {
+  // Remove leftover test record if created during prior diagnostic checks
+  db.prepare("DELETE FROM jurusan WHERE kode = 'TEST1'").run();
+
+  const existingUsers = db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number };
+  if (existingUsers.cnt === 0) {
+    if (fs.existsSync(BACKUP_PATH)) {
+      try {
+        const raw = fs.readFileSync(BACKUP_PATH, 'utf8');
+        const parsed = JSON.parse(raw) as BackupSnapshot;
+        restoreFromSnapshot(parsed);
+        return;
+      } catch {
+        // Fall through to seed if snapshot is unreadable
+      }
+    }
+    seedInitialData();
+    saveBackupSnapshot();
+  } else if (!fs.existsSync(BACKUP_PATH)) {
+    saveBackupSnapshot();
+  }
+}
+
+initializeDatabase();
+
+export function getDatabaseStatus(): DatabaseStatus {
+  const countOf = (table: string) =>
+    (db.prepare(`SELECT COUNT(*) as c FROM ${table}`).get() as { c: number }).c;
+
+  const journalRow = db.prepare('PRAGMA journal_mode;').get() as Record<string, unknown>;
+  const syncRow = db.prepare('PRAGMA synchronous;').get() as Record<string, unknown>;
+  const dbStat = fs.existsSync(DB_PATH) ? fs.statSync(DB_PATH) : null;
+  const backupStat = fs.existsSync(BACKUP_PATH) ? fs.statSync(BACKUP_PATH) : null;
+
+  return {
+    engine: 'SQLite 3 (node:sqlite)',
+    fileName: 'data/manajemen_sekolah.db',
+    fileSizeBytes: dbStat?.size ?? 0,
+    journalMode: String(Object.values(journalRow)[0] ?? 'delete').toUpperCase(),
+    synchronousMode: String(Object.values(syncRow)[0] ?? '2') === '2' ? 'FULL' : 'NORMAL',
+    lastSavedAt,
+    backupExists: Boolean(backupStat),
+    backupSizeBytes: backupStat?.size ?? 0,
+    tables: {
+      users: countOf('users'),
+      sessions: countOf('sessions'),
+      jurusan: countOf('jurusan'),
+      kelas: countOf('kelas'),
+      siswa: countOf('siswa'),
+      guru: countOf('guru'),
+      mata_pelajaran: countOf('mata_pelajaran'),
+      activity_logs: countOf('activity_logs'),
+      chat_messages: countOf('chat_messages'),
+    },
+  };
+}
+
+export function listChatMessages(userId: string | null): PersistedChatMessage[] {
+  if (userId) {
+    return db
+      .prepare('SELECT * FROM chat_messages WHERE user_id = ? ORDER BY created_at ASC LIMIT 80')
+      .all(userId) as unknown as PersistedChatMessage[];
+  }
+  return db
+    .prepare('SELECT * FROM chat_messages WHERE user_id IS NULL ORDER BY created_at ASC LIMIT 80')
+    .all() as unknown as PersistedChatMessage[];
+}
+
+export function saveChatMessage(input: {
+  userId: string | null;
+  role: 'user' | 'assistant';
+  text: string;
+}): PersistedChatMessage {
+  const id = generateId('msg');
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO chat_messages (id, user_id, role, text, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, input.userId, input.role, input.text, createdAt);
+  scheduleBackupSnapshot();
+  return {
+    id,
+    user_id: input.userId,
+    role: input.role,
+    text: input.text,
+    created_at: createdAt,
+  };
+}
+
+export function clearChatMessages(userId: string | null): void {
+  if (userId) {
+    db.prepare('DELETE FROM chat_messages WHERE user_id = ?').run(userId);
+  } else {
+    db.prepare('DELETE FROM chat_messages WHERE user_id IS NULL').run();
+  }
+  scheduleBackupSnapshot();
+}
+
+export function closeDatabaseCleanly(): void {
+  if (backupTimer) {
+    clearTimeout(backupTimer);
+    backupTimer = null;
+  }
+  saveBackupSnapshot();
+  try {
+    db.close();
+  } catch {
+    // Already closed
+  }
+}
 
 export function sanitizeUser(row: Record<string, unknown>): User {
   return {

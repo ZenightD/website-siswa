@@ -6,13 +6,18 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenAI } from '@google/genai';
-import { createServer as createViteServer } from 'vite';
 import {
+  buildBackupSnapshot,
+  clearChatMessages,
+  closeDatabaseCleanly,
+  DB_PATH,
   db,
   generateId,
   getDashboardAnalytics,
+  getDatabaseStatus,
   hashPassword,
   listActivities,
+  listChatMessages,
   listGuru,
   listJurusan,
   listKelas,
@@ -20,10 +25,14 @@ import {
   listSiswa,
   listUsers,
   recordActivity,
+  restoreFromSnapshot,
   sanitizeUser,
+  saveChatMessage,
+  scheduleBackupSnapshot,
   verifyPassword,
-} from './server/db.js';
-import type { ActivityLog, OnlineUser, User, UserRole } from './src/types.js';
+  type BackupSnapshot,
+} from './server/db.ts';
+import type { ActivityLog, OnlineUser, User, UserRole } from './src/types.ts';
 
 interface AuthedRequest extends Request {
   authUser?: User;
@@ -81,6 +90,7 @@ function broadcastPresence() {
 }
 
 function emitActivityAndSync(log: ActivityLog, syncModule?: string) {
+  scheduleBackupSnapshot();
   broadcastWs('activity:created', log);
   if (syncModule) {
     broadcastWs('data:synced', {
@@ -234,7 +244,7 @@ app.post('/api/auth/register', (req: Request, res: Response) => {
   `).run(id, name.trim(), normalizedEmail, passwordHash, validRole, avatarColor, nowIso, nowIso);
 
   const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 7 * 24 * 3600_000).toISOString();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 3600_000).toISOString();
   const { ip, ua } = getClientMeta(req);
 
   db.prepare(`
@@ -290,7 +300,7 @@ app.post('/api/auth/login', (req: Request, res: Response) => {
   db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?').run(nowIso, String(row.id));
 
   const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 7 * 24 * 3600_000).toISOString();
+  const expiresAt = new Date(Date.now() + 30 * 24 * 3600_000).toISOString();
   const { ip, ua } = getClientMeta(req);
 
   db.prepare(`
@@ -356,12 +366,94 @@ app.get('/api/bootstrap', optionalAuth, (req: AuthedRequest, res: Response) => {
   if (req.authUser) {
     payload.users = listUsers();
     payload.activities = listActivities({ limit: 150 });
+    payload.database_status = getDatabaseStatus();
   } else {
     payload.users = [];
     payload.activities = [];
+    payload.database_status = null;
   }
 
   res.json(payload);
+});
+
+// ================= LOCAL DATABASE BACKUP & RESTORE =================
+
+app.get('/api/database/status', requireAuth, (_req: AuthedRequest, res: Response) => {
+  res.json({ status: getDatabaseStatus() });
+});
+
+app.get('/api/database/backup-json', requireAuth, (req: AuthedRequest, res: Response) => {
+  const started = Date.now();
+  const snapshot = buildBackupSnapshot(req.authUser?.role === 'admin');
+  const { ip, ua } = getClientMeta(req);
+  const log = recordActivity({
+    user: req.authUser,
+    action: 'EXPORT',
+    module: 'Laporan',
+    targetId: 'database_backup_json',
+    description: `Mengunduh cadangan lengkap database lokal (JSON)`,
+    metadata: { format: 'JSON', exportedAt: snapshot.exported_at },
+    ipAddress: ip,
+    userAgent: ua,
+    durationMs: Date.now() - started,
+  });
+  emitActivityAndSync(log);
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="backup-manajemen-sekolah-${new Date().toISOString().slice(0, 10)}.json"`
+  );
+  res.send(JSON.stringify(snapshot, null, 2));
+});
+
+app.get('/api/database/download-sqlite', requireAuth, (req: AuthedRequest, res: Response) => {
+  if (req.authUser?.role !== 'admin') {
+    res.status(403).json({ error: 'Hanya administrator yang dapat mengunduh file SQLite mentah.' });
+    return;
+  }
+  const started = Date.now();
+  const { ip, ua } = getClientMeta(req);
+  const log = recordActivity({
+    user: req.authUser,
+    action: 'EXPORT',
+    module: 'Laporan',
+    targetId: 'database_sqlite_file',
+    description: `Mengunduh berkas database SQLite lokal (manajemen_sekolah.db)`,
+    ipAddress: ip,
+    userAgent: ua,
+    durationMs: Date.now() - started,
+  });
+  emitActivityAndSync(log);
+  res.download(DB_PATH, `manajemen_sekolah-${new Date().toISOString().slice(0, 10)}.db`);
+});
+
+app.post('/api/database/restore-json', requireAuth, (req: AuthedRequest, res: Response) => {
+  if (req.authUser?.role !== 'admin') {
+    res.status(403).json({ error: 'Hanya administrator yang dapat memulihkan database dari cadangan.' });
+    return;
+  }
+  const started = Date.now();
+  try {
+    const snapshot = req.body as BackupSnapshot;
+    const result = restoreFromSnapshot(snapshot);
+    const { ip, ua } = getClientMeta(req);
+    const log = recordActivity({
+      user: req.authUser,
+      action: 'UPDATE',
+      module: 'Laporan',
+      targetId: 'database_restore',
+      description: `Memulihkan database lokal dari file cadangan JSON (${result.restoredRows} baris)`,
+      metadata: { restoredRows: result.restoredRows },
+      ipAddress: ip,
+      userAgent: ua,
+      durationMs: Date.now() - started,
+    });
+    emitActivityAndSync(log, 'all');
+    res.json({ ok: true, restoredRows: result.restoredRows, status: getDatabaseStatus() });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Gagal memulihkan file cadangan.';
+    res.status(400).json({ error: msg });
+  }
 });
 
 app.get('/api/activities', requireAuth, (req: AuthedRequest, res: Response) => {
@@ -1038,6 +1130,16 @@ app.delete('/api/mata-pelajaran/:id', requireAuth, (req: AuthedRequest, res: Res
 
 // ================= GEMINI AI CHATBOX ENDPOINT =================
 
+app.get('/api/chat/history', optionalAuth, (req: AuthedRequest, res: Response) => {
+  const messages = listChatMessages(req.authUser?.id ?? null);
+  res.json({ messages });
+});
+
+app.delete('/api/chat/history', optionalAuth, (req: AuthedRequest, res: Response) => {
+  clearChatMessages(req.authUser?.id ?? null);
+  res.json({ ok: true });
+});
+
 app.post('/api/chat', optionalAuth, async (req: AuthedRequest, res: Response) => {
   const started = Date.now();
   const { message, history } = req.body as {
@@ -1117,6 +1219,17 @@ Berikan jawaban yang terfokus maksimal 3-5 paragraf pendek atau poin ringkas.`;
       return;
     }
 
+    saveChatMessage({
+      userId: req.authUser?.id ?? null,
+      role: 'user',
+      text: message.trim(),
+    });
+    saveChatMessage({
+      userId: req.authUser?.id ?? null,
+      role: 'assistant',
+      text: replyText,
+    });
+
     const { ip, ua } = getClientMeta(req);
     const log = recordActivity({
       user: req.authUser ?? null,
@@ -1142,6 +1255,7 @@ Berikan jawaban yang terfokus maksimal 3-5 paragraf pendek atau poin ringkas.`;
 
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1164,5 +1278,16 @@ async function startServer() {
     console.log(`Manajemen Sekolah server running on http://localhost:${PORT}`);
   });
 }
+
+const handleShutdown = () => {
+  closeDatabaseCleanly();
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 1500);
+};
+
+process.on('SIGINT', handleShutdown);
+process.on('SIGTERM', handleShutdown);
 
 startServer();

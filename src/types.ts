@@ -145,3 +145,33 @@ export interface DashboardAnalytics {
 
 export type AppSection = 'portal' | 'dashboard' | 'akademik' | 'pengguna';
 export type AcademicTab = 'jurusan' | 'kelas' | 'siswa' | 'guru' | 'mapel';
+
+export interface DatabaseStatus {
+  engine: string;
+  fileName: string;
+  fileSizeBytes: number;
+  journalMode: string;
+  synchronousMode: string;
+  lastSavedAt: string;
+  backupExists: boolean;
+  backupSizeBytes: number;
+  tables: {
+    users: number;
+    sessions: number;
+    jurusan: number;
+    kelas: number;
+    siswa: number;
+    guru: number;
+    mata_pelajaran: number;
+    activity_logs: number;
+    chat_messages: number;
+  };
+}
+
+export interface PersistedChatMessage {
+  id: string;
+  user_id: string | null;
+  role: 'user' | 'assistant';
+  text: string;
+  created_at: string;
+}

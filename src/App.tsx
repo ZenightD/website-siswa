@@ -11,6 +11,7 @@ import type {
   ActivityLog,
   AppSection,
   DashboardAnalytics,
+  DatabaseStatus,
   Guru,
   Jurusan,
   Kelas,
@@ -45,6 +46,7 @@ export default function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
 
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
+  const [databaseStatus, setDatabaseStatus] = useState<DatabaseStatus | null>(null);
   const [jurusan, setJurusan] = useState<Jurusan[]>([]);
   const [kelas, setKelas] = useState<Kelas[]>([]);
   const [siswa, setSiswa] = useState<Siswa[]>([]);
@@ -76,6 +78,7 @@ export default function App() {
       if (!res.ok) return;
       const data = await res.json();
       setAnalytics(data.analytics ?? null);
+      setDatabaseStatus(data.database_status ?? null);
       setJurusan(data.jurusan ?? []);
       setKelas(data.kelas ?? []);
       setSiswa(data.siswa ?? []);
@@ -411,11 +414,13 @@ export default function App() {
         {section === 'dashboard' && currentUser && authToken && (
           <DashboardView
             analytics={analytics}
+            databaseStatus={databaseStatus}
             activities={activities}
             onlineUsers={onlineUsers}
             wsConnected={wsConnected}
             currentUser={currentUser}
             authToken={authToken}
+            onRefreshData={() => fetchBootstrap(authToken)}
           />
         )}
 
